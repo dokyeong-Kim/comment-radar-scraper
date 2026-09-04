@@ -12,8 +12,9 @@ Render Environment Variables
 필수:
 - API_TOKEN
 선택(Private fallback을 쓰려면 필요):
-- SCRAPER_IG_USERNAME
-- SCRAPER_IG_PASSWORD
+- SCRAPER_IG_SESSIONID (권장: 이미 정상 로그인된 세션 쿠키)
+- SCRAPER_IG_USERNAME (sessionid 실패 시 선택 fallback)
+- SCRAPER_IG_PASSWORD (sessionid 실패 시 선택 fallback)
 
 기존:
 - PUBLIC_TRANSPORT=curl
@@ -48,6 +49,7 @@ app = FastAPI(title="Comment Radar Instagram Scraper")
 
 API_TOKEN = os.getenv("API_TOKEN", "").strip()
 
+SCRAPER_IG_SESSIONID = os.getenv("SCRAPER_IG_SESSIONID", "").strip()
 SCRAPER_IG_USERNAME = os.getenv("SCRAPER_IG_USERNAME", "").strip()
 SCRAPER_IG_PASSWORD = os.getenv("SCRAPER_IG_PASSWORD", "").strip()
 
@@ -452,13 +454,25 @@ def get_private_client(
     force_fresh: bool = False,
 ) -> Client:
     """
-    세션 파일이 있으면 재사용.
-    로그인 성공 후 다시 dump.
+    우선순위:
+    1) SCRAPER_IG_SESSIONID가 있으면 sessionid 로그인
+    2) 실패하거나 sessionid가 없으면 username/password 로그인
+    3) 성공한 settings는 /tmp 세션 파일로 저장/재사용
+
+    Render의 새 인스턴스에서는 /tmp가 초기화될 수 있으므로
+    SCRAPER_IG_SESSIONID 또는 username/password 중 하나는 항상
+    Environment Variable로 유지하는 것을 권장합니다.
     """
     global _private_cl
 
-    if not SCRAPER_IG_USERNAME or not SCRAPER_IG_PASSWORD:
+    has_sessionid = bool(SCRAPER_IG_SESSIONID)
+    has_password_login = bool(
+        SCRAPER_IG_USERNAME and SCRAPER_IG_PASSWORD
+    )
+
+    if not has_sessionid and not has_password_login:
         raise RuntimeError(
+            "SCRAPER_IG_SESSIONID 또는 "
             "SCRAPER_IG_USERNAME / SCRAPER_IG_PASSWORD 미설정"
         )
 
@@ -477,41 +491,78 @@ def get_private_client(
             except Exception:
                 pass
 
-        try:
-            cl.login(
-                SCRAPER_IG_USERNAME,
-                SCRAPER_IG_PASSWORD,
-            )
-        except Exception:
-            # 손상된/만료 세션일 수 있으므로
-            # 한 번만 세션 없는 새 클라이언트로 재시도
-            if not force_fresh and SESSION_FILE.exists():
+        session_error = None
+
+        # 1) 브라우저에서 얻은 sessionid 우선
+        if has_sessionid:
+            try:
+                cl.login_by_sessionid(
+                    SCRAPER_IG_SESSIONID
+                )
+
                 try:
-                    SESSION_FILE.unlink(missing_ok=True)
+                    SESSION_FILE.parent.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+                    cl.dump_settings(
+                        str(SESSION_FILE)
+                    )
                 except Exception:
                     pass
 
+                _private_cl = cl
+                return cl
+
+            except Exception as exc:
+                session_error = exc
+
+                # password fallback을 위해 깨끗한 client로 교체
                 cl = _new_private_client()
+
+        # 2) username/password fallback
+        if has_password_login:
+            try:
+                if (
+                    not force_fresh
+                    and SESSION_FILE.exists()
+                ):
+                    try:
+                        cl.load_settings(
+                            str(SESSION_FILE)
+                        )
+                    except Exception:
+                        pass
 
                 cl.login(
                     SCRAPER_IG_USERNAME,
                     SCRAPER_IG_PASSWORD,
                 )
-            else:
+
+                try:
+                    SESSION_FILE.parent.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+                    cl.dump_settings(
+                        str(SESSION_FILE)
+                    )
+                except Exception:
+                    pass
+
+                _private_cl = cl
+                return cl
+
+            except Exception:
+                # sessionid 실패가 먼저 있었고 password fallback도 실패했다면
+                # password 오류를 그대로 올린다. Apps Script가 유형별 Slack을 보낸다.
                 raise
 
-        try:
-            SESSION_FILE.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
-            cl.dump_settings(str(SESSION_FILE))
-        except Exception:
-            # 세션 저장 실패가 수집 자체를 막지는 않음
-            pass
+        # sessionid만 설정돼 있고 그것도 실패
+        if session_error is not None:
+            raise session_error
 
-        _private_cl = cl
-        return cl
+        raise RuntimeError("Instagram private login 실패")
 
 
 # ─────────────────────────────────────
@@ -631,9 +682,10 @@ def health() -> dict[str, Any]:
         "ok": True,
         "service": "comment-radar-instagram-scraper",
         "private_fallback_configured": bool(
-            SCRAPER_IG_USERNAME
-            and SCRAPER_IG_PASSWORD
+            SCRAPER_IG_SESSIONID
+            or (SCRAPER_IG_USERNAME and SCRAPER_IG_PASSWORD)
         ),
+        "sessionid_configured": bool(SCRAPER_IG_SESSIONID),
     }
 
 
@@ -713,15 +765,19 @@ def comments(
     # ─────────────────────────────
 
     if not (
-        SCRAPER_IG_USERNAME
-        and SCRAPER_IG_PASSWORD
+        SCRAPER_IG_SESSIONID
+        or (
+            SCRAPER_IG_USERNAME
+            and SCRAPER_IG_PASSWORD
+        )
     ):
         raise_typed_http(
             "PUBLIC_GQL_FAILED",
             (
                 "Public GraphQL 실패. "
-                "Private fallback용 SCRAPER_IG_USERNAME / "
-                "SCRAPER_IG_PASSWORD가 설정되지 않았습니다."
+                "Private fallback용 SCRAPER_IG_SESSIONID 또는 "
+                "SCRAPER_IG_USERNAME / SCRAPER_IG_PASSWORD가 "
+                "설정되지 않았습니다."
             ),
             public_error=public_error,
         )
